@@ -25,22 +25,29 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
 import javax.servlet.Filter;
 import javax.servlet.FilterChain;
 import javax.servlet.FilterConfig;
 import javax.servlet.ServletException;
 import javax.servlet.ServletRequest;
 import javax.servlet.ServletResponse;
+
 import org.apache.felix.scr.annotations.Activate;
 import org.apache.felix.scr.annotations.Component;
 import org.apache.felix.scr.annotations.PropertyUnbounded;
+import org.apache.felix.scr.annotations.Reference;
+import org.apache.felix.scr.annotations.ReferenceCardinality;
+import org.apache.felix.scr.annotations.ReferencePolicy;
 import org.apache.felix.scr.annotations.Service;
 import org.apache.felix.scr.annotations.Properties;
 import org.apache.felix.scr.annotations.Property;
+import org.apache.sling.api.SlingConstants;
 import org.apache.sling.api.SlingHttpServletRequest;
 import org.apache.sling.api.SlingHttpServletResponse;
 import org.apache.sling.api.wrappers.SlingHttpServletResponseWrapper;
 import org.apache.sling.commons.osgi.PropertiesUtil;
+import org.apache.sling.security.ContentDispositionServletConfiguration;
 import org.osgi.service.component.ComponentContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,6 +59,9 @@ label=" Apache Sling Content Disposition Filter")
 @Properties({
         @Property(name = "sling.filter.scope", value = { "request" }, propertyPrivate = true),
         @Property(name = "service.ranking", intValue = -25000, propertyPrivate = true) })
+@Reference(referenceInterface = ContentDispositionServletConfiguration.class,
+        cardinality=ReferenceCardinality.OPTIONAL_MULTIPLE, policy = ReferencePolicy.DYNAMIC,
+        bind="bindServletConfiguration", unbind="unbindServletConfiguration")
 public class ContentDispositionFilter implements Filter {
     
     /** Logger. */
@@ -64,6 +74,9 @@ public class ContentDispositionFilter implements Filter {
                     , unbounded = PropertyUnbounded.ARRAY, value = { "" })
     private static final String PROP_CONTENT_DISPOSTION_PATHS = "sling.content.disposition.paths";
    
+    private ArrayList<ContentDispositionServletConfiguration> servletConfigurations =
+    new ArrayList<ContentDispositionServletConfiguration>();
+    
     /**
      * Set of paths
      */
@@ -73,12 +86,28 @@ public class ContentDispositionFilter implements Filter {
      * Array of prefixes of paths
      */
     private String[] contentDispositionPathsPfx;
+    
+    /**
+     * Set of whitelisted destination servlets
+     */
+    volatile Set<String> contentDispositionServletWhitelist;
+    /**
+     * Array of prefixes of servlets
+     */
+    volatile private String[] contentDispositionServletWhitelistPfx;
+    
+    /**
+     * Only update the servlet whitelist values after an update.
+     */
+    volatile boolean servletConfigurationsInvalid = true;
 
     private Map<String, Set<String>> contentTypesMapping;
-    
+
     @Activate
     private void activate(final ComponentContext ctx) {
         final Dictionary props = ctx.getProperties();
+
+        updateServletConfiguration();
         
         String[] contentDispostionProps = PropertiesUtil.toStringArray(props.get(PROP_CONTENT_DISPOSTION_PATHS));
         
@@ -128,8 +157,7 @@ public class ContentDispositionFilter implements Filter {
         contentTypesMapping = contentTypesMap.isEmpty()?Collections.<String, Set<String>>emptyMap(): contentTypesMap;
         
         logger.info("Initialized. content disposition paths: {}, content disposition paths-pfx {}", new Object[]{
-                contentDispositionPaths, contentDispositionPathsPfx}
-        );
+                contentDispositionPaths, contentDispositionPathsPfx});
     }
     
 
@@ -151,7 +179,8 @@ public class ContentDispositionFilter implements Filter {
 
         chain.doFilter(request, rewriterResponse);
     }
-    
+
+
     //---------- PRIVATE METHODS ---------
     
     private static Set<String> getContentTypes(String contentTypes) {
@@ -164,6 +193,59 @@ public class ContentDispositionFilter implements Filter {
         }
         return contentTypesSet;
     }
+
+    public void bindServletConfiguration(ContentDispositionServletConfiguration config) {
+        synchronized(servletConfigurations) {
+            servletConfigurations.add(config);
+            servletConfigurationsInvalid = true;
+        }
+    }
+
+    public void unbindServletConfiguration(ContentDispositionServletConfiguration config) {
+        synchronized(servletConfigurations) {
+            servletConfigurations.remove(config);
+            servletConfigurationsInvalid = true;
+        }
+    }
+    
+    private void updateServletConfiguration() {
+        synchronized (servletConfigurations) {
+            if (!servletConfigurationsInvalid) {
+                return;
+            }
+            Set<String> servlets = new HashSet<String>();
+            List<String> servletPrefixes = new ArrayList<String>();
+
+            for (ContentDispositionServletConfiguration config: servletConfigurations) {
+                for (String path : config.getWhitelistedServlets() != null ?
+                    config.getWhitelistedServlets() : new String[] {}) {
+                    path = path.trim();
+                    if (path.length() > 0) {
+                        if (path.endsWith("*")) {
+                            String prefix = path.substring(0, path.length() - 1);
+                            if (prefix.length() > 0) {
+                                servletPrefixes.add(prefix);
+                            } else {
+                                logger.info("Catch all servlet whitelisting not allowed.");
+                            }
+                        } else {
+                            servlets.add(path);
+                        }
+                    }
+                }
+            }
+            
+            /*
+             * Explicitly accepting that the checking of the whitelists *could* be seen as inconsistent.
+             * One or the other could represent an older or newer state of the configuration than the other.
+             */
+            contentDispositionServletWhitelist = servlets.isEmpty() ? Collections.<String>emptySet() : servlets;
+            contentDispositionServletWhitelistPfx = servletPrefixes.toArray(new String[servletPrefixes.size()]);
+            logger.info("servlet whitelist {}, servlet whitelist by prefix {}", new Object[]{
+                contentDispositionServletWhitelist, contentDispositionServletWhitelistPfx});
+            servletConfigurationsInvalid = false;
+        }
+    }
     
     //----------- INNER CLASSES ------------ 
 
@@ -172,6 +254,11 @@ public class ContentDispositionFilter implements Filter {
         private static final String CONTENT_DISPOSTION = "Content-Disposition";
 
         private static final String CONTENT_DISPOSTION_ATTACHMENT = "attachment";
+        
+        static final String CONTENT_TYPE_ATTRIBUTE =
+                "org.apache.sling.security.impl.ContentDispositionFilter.RewriterResponse.contentType";
+        static final String WHITELISTED_ATTRIBUTE =
+                "org.apache.sling.security.impl.ContentDispositionFilter.RewriterResponse.whiteListed";
         
         /** The current request. */
         private final SlingHttpServletRequest request;
@@ -185,8 +272,46 @@ public class ContentDispositionFilter implements Filter {
          * @see javax.servlet.ServletResponseWrapper#setContentType(java.lang.String)
          */
         public void setContentType(String type) { 
-            String pathInfo = request.getPathInfo();
+            // once whitelisted by servlet, always whitelisted
+            if (request.getAttribute(WHITELISTED_ATTRIBUTE) != null) {
+                passThru(type);
+                return;
+            }
+            String previousContentType = (String) request.getAttribute(CONTENT_TYPE_ATTRIBUTE);
+            
+            if (previousContentType != null) {
+                if(previousContentType.equals(type)) {
+                    passThru(type);
+                    return;
+                } else {
+                    int idx = type.indexOf(';');
+                    if (idx >= 0) {
+                        if (previousContentType.equals(type.substring(0, idx))) {
+                            passThru(type);
+                            return;
+                        }
+                    }
+                }
+            }
+            
+            String servletName = (String)request.getAttribute(SlingConstants.SLING_CURRENT_SERVLET_NAME);
+            updateServletConfiguration();
+            if (contentDispositionServletWhitelist.contains(servletName)) {
+                whiteListByServlet();
+                passThru(type);
+                return;
+            }
+            for (String servletPrefix : contentDispositionServletWhitelistPfx) {
+                if (servletName.startsWith(servletPrefix)) {
+                    whiteListByServlet();
+                    passThru(type);
+                    return;
+                }
+            }
 
+            request.setAttribute(CONTENT_TYPE_ATTRIBUTE, type);
+            
+            String pathInfo = request.getPathInfo();
             if (contentDispositionPaths.contains(pathInfo)) {
 
                 if (contentTypesMapping.containsKey(pathInfo)) {
@@ -217,8 +342,20 @@ public class ContentDispositionFilter implements Filter {
             super.setContentType(type);
         }    
         
+        private void whiteListByServlet() {
+            request.setAttribute(WHITELISTED_ATTRIBUTE, WHITELISTED_ATTRIBUTE);
+            
+        }
+
+        private void passThru(String type) {
+            super.setContentType(type);
+            
+        }
+
         private void setContentDisposition() {
-            this.addHeader(CONTENT_DISPOSTION, CONTENT_DISPOSTION_ATTACHMENT);
+            if (!this.containsHeader(CONTENT_DISPOSTION)) {
+                this.addHeader(CONTENT_DISPOSTION, CONTENT_DISPOSTION_ATTACHMENT);
+            }
         }
     }
 }
